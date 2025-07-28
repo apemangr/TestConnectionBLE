@@ -1,0 +1,3 @@
+11101104A7CD93EC7 : Cambia la MAC
+11103             : Reinicia el dispositivo
+11111 : Solicita un registro por ID
