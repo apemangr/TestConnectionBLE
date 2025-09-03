@@ -1,11 +1,14 @@
 import asyncio
 import os
+import csv
+from datetime import datetime
 from bleak import BleakScanner, BleakClient
 
 NUS_TX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 LAST_DEVICE_FILE = "last_device.txt"
 COMS_FILE = "coms.txt"
+LOG_FILE = "received_data.txt"
 
 client = None
 reconnecting = False
@@ -16,15 +19,174 @@ def clear_console():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
+def interpret_binary_data(hex_string):
+    """
+    Interpreta los datos binarios según el formato especificado
+    """
+    try:
+        # Convertir hex string a bytes
+        data = bytes.fromhex(hex_string)
+        
+        if len(data) < 44:  # Mínimo de bytes esperados
+            return None
+            
+        # Verificar magic byte
+        if data[0] != 0x98 and data[0] != 0x08:
+            return None
+            
+        # Extraer datos
+        result = {}
+        
+        # Fecha y hora (bytes 1-7)
+        result['day'] = data[1]
+        result['month'] = data[2]
+        result['year'] = (data[3] << 8) | data[4]
+        result['hour'] = data[5]
+        result['minute'] = data[6]
+        result['second'] = data[7]
+        
+        # Contador (bytes 8-11, big-endian)
+        result['contador'] = (data[8] << 24) | (data[9] << 16) | (data[10] << 8) | data[11]
+        
+        # V1, V2 (bytes 12-15, big-endian)
+        result['V1'] = (data[12] << 8) | data[13]
+        result['V2'] = (data[14] << 8) | data[15]
+        
+        # Battery (byte 16)
+        result['battery'] = data[16]
+        
+        # MACs (bytes 17-28) - se omiten por ahora ya que son ceros
+        
+        # V3-V8 (bytes 29-40, big-endian)
+        result['V3'] = (data[29] << 8) | data[30]
+        result['V4'] = (data[31] << 8) | data[32]
+        result['V5'] = (data[33] << 8) | data[34]
+        result['V6'] = (data[35] << 8) | data[36]
+        result['V7'] = (data[37] << 8) | data[38]
+        result['V8'] = (data[39] << 8) | data[40]
+        
+        # Temperatura (byte 41)
+        result['temp'] = data[41]
+        
+        # Last position (bytes 42-43)
+        result['last_pos'] = (data[42] << 8) | data[43]
+        
+        return result
+        
+    except Exception as e:
+        return None
+
+
+def format_interpreted_data(data):
+    """
+    Formatea los datos interpretados para mostrar en una línea legible
+    """
+    if not data:
+        return "❌ Datos no válidos"
+        
+    fecha = f"{data['day']:02d}/{data['month']:02d}/{data['year']}"
+    hora = f"{data['hour']:02d}:{data['minute']:02d}:{data['second']:02d}"
+    
+    return (f"📊 {fecha} {hora} | Cnt:{data['contador']} | "
+            f"V1:{data['V1']} V2:{data['V2']} V3:{data['V3']} V4:{data['V4']} "
+            f"V5:{data['V5']} V6:{data['V6']} V7:{data['V7']} V8:{data['V8']} | "
+            f"Bat:{data['battery']} Temp:{data['temp']}°C")
+
+
+def generate_csv_from_log(log_file, csv_file):
+    """
+    Genera un archivo CSV con los datos interpretados del log
+    """
+    try:
+        interpreted_data = []
+        
+        if not os.path.exists(log_file):
+            return 0, "No existe el archivo de log"
+            
+        with open(log_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        for line in lines:
+            line = line.strip()
+            if "Binario (hex):" in line:
+                # Extraer timestamp y datos hex
+                parts = line.split(" - Binario (hex): ")
+                if len(parts) == 2:
+                    timestamp = parts[0]
+                    hex_data = parts[1]
+                    
+                    # Interpretar datos
+                    interpreted = interpret_binary_data(hex_data)
+                    if interpreted:
+                        # Formatear fecha
+                        fecha = f"{interpreted['day']:02d}/{interpreted['month']:02d}/{interpreted['year']}"
+                        hora = f"{interpreted['hour']:02d}:{interpreted['minute']:02d}:{interpreted['second']:02d}"
+                        fecha_hora = f"{fecha} {hora}"
+                        
+                        # Por ahora usamos "N/A" para MAC ya que no está en los datos actuales
+                        # Los bytes 17-28 están reservados para MACs pero están llenos de ceros
+                        mac = "N/A"
+                        
+                        interpreted_data.append({
+                            'Fecha': fecha_hora,
+                            'Equipo(MAC)': mac,
+                            'Counter': interpreted['contador'],
+                            'V1': interpreted['V1'],
+                            'V2': interpreted['V2'],
+                            'Bateria': interpreted['battery']
+                        })
+        
+        # Escribir CSV
+        if interpreted_data:
+            with open(csv_file, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['Fecha', 'Equipo(MAC)', 'Counter', 'V1', 'V2', 'Bateria']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for row in interpreted_data:
+                    writer.writerow(row)
+            
+            return len(interpreted_data), None
+        else:
+            return 0, "No se encontraron datos interpretables"
+            
+    except Exception as e:
+        return 0, f"Error al generar CSV: {e}"
+
+
 def handle_rx(_, data: bytearray):
+    # Obtener timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Determinar el contenido a mostrar y guardar
     if len(data) == 3:
         cmd, a, b = data[0], data[1], data[2]
-        print(f"📥 Evt={cmd}, A={a}, B={b}")
+        message = f"Evt={cmd}, A={a}, B={b}"
+        print(f"📥 {message}")
+        log_entry = f"{timestamp} - {message}\n"
     else:
         try:
-            print(f"📥 Texto: {data.decode('utf-8').strip()}")
+            decoded_text = data.decode('utf-8').strip()
+            print(f"📥 Texto: {decoded_text}")
+            log_entry = f"{timestamp} - Texto: {decoded_text}\n"
         except UnicodeDecodeError:
-            print(f"📥 Binario (hex): {data.hex()}")
+            hex_data = data.hex()
+            print(f"📥 Binario (hex): {hex_data}")
+            
+            # Intentar interpretar los datos binarios automáticamente
+            interpreted = interpret_binary_data(hex_data)
+            if interpreted:
+                formatted = format_interpreted_data(interpreted)
+                print(f"🔍 Interpretado: {formatted}")
+            
+            log_entry = f"{timestamp} - Binario (hex): {hex_data}\n"
+    
+    # Guardar en archivo
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_entry)
+    except Exception as e:
+        print(f"⚠️ Error al guardar en log: {e}")
 
 
 def on_disconnect(c):
@@ -117,6 +279,7 @@ async def handle_reconnection():
 
 async def command_loop():
     global client, reconnect_event
+    print("💡 Comandos especiales: 'com' (lista comandos), 'log' (ver log), 'interplog' (interpretar log + generar CSV), 'clearlog' (limpiar log), 'clc' (limpiar pantalla), 'exit/quit' (salir)")
     while True:
         try:
             inp = input("➡️ ").strip()
@@ -124,6 +287,80 @@ async def command_loop():
 
             if low == 'clc':
                 clear_console()
+                continue
+
+            if low == 'log':
+                if os.path.exists(LOG_FILE):
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    print(f"📄 Archivo de log: {LOG_FILE}")
+                    print(f"📊 Total de líneas: {len(lines)}")
+                    if lines:
+                        print("🕒 Últimas 5 entradas:")
+                        for line in lines[-5:]:
+                            print(f"   {line.strip()}")
+                else:
+                    print(f"📄 No existe el archivo de log: {LOG_FILE}")
+                continue
+
+            if low == 'interplog':
+                if os.path.exists(LOG_FILE):
+                    # Generar CSV
+                    csv_filename = f"datos_interpretados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    count, error = generate_csv_from_log(LOG_FILE, csv_filename)
+                    
+                    if error:
+                        print(f"❌ Error: {error}")
+                        continue
+                    
+                    print(f"📊 CSV generado: {csv_filename}")
+                    print(f"✅ Registros exportados: {count}")
+                    
+                    # Mostrar también en pantalla
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    
+                    print(f"\n🔍 Interpretando log: {LOG_FILE}")
+                    print(f"📊 Total de líneas: {len(lines)}")
+                    print("=" * 120)
+                    
+                    interpreted_count = 0
+                    for line in lines:
+                        line = line.strip()
+                        if "Binario (hex):" in line:
+                            # Extraer timestamp y datos hex
+                            parts = line.split(" - Binario (hex): ")
+                            if len(parts) == 2:
+                                timestamp = parts[0]
+                                hex_data = parts[1]
+                                
+                                # Interpretar datos
+                                interpreted = interpret_binary_data(hex_data)
+                                if interpreted:
+                                    formatted = format_interpreted_data(interpreted)
+                                    print(f"{timestamp} | {formatted}")
+                                    interpreted_count += 1
+                                else:
+                                    print(f"{timestamp} | ❌ Datos no interpretables: {hex_data}")
+                        elif "Texto:" in line:
+                            # Mostrar texto tal como está
+                            print(f"{line}")
+                        elif "Evt=" in line:
+                            # Mostrar eventos tal como están
+                            print(f"{line}")
+                    
+                    print("=" * 120)
+                    print(f"✅ Registros interpretados: {interpreted_count}")
+                else:
+                    print(f"📄 No existe el archivo de log: {LOG_FILE}")
+                continue
+
+            if low == 'clearlog':
+                if os.path.exists(LOG_FILE):
+                    os.remove(LOG_FILE)
+                    print(f"🗑️ Archivo de log eliminado: {LOG_FILE}")
+                else:
+                    print(f"📄 No existe el archivo de log: {LOG_FILE}")
                 continue
 
             # comando rápido: com <índice>
