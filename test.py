@@ -20,6 +20,55 @@ seen_hex = set()
 def clear_console():
     os.system('cls' if os.name == 'nt' else 'clear')
 
+def interpret_adv_history(hex_string):
+    """
+    Interpreta historial ADV (empieza con 0xAD)
+    Formato: 17 bytes
+    Byte 0: 0xAD (prefijo)
+    Bytes 1-7: Fecha/hora
+    Bytes 8-11: Contador
+    Bytes 12-15: V1, V2
+    Byte 16: 0xFF (marcador de fin)
+    """
+    try:
+        data = bytes.fromhex(hex_string)
+        
+        # Verificar longitud mínima y magic byte
+        if len(data) < 17:
+            return None
+        if data[0] != 0xAD:
+            return None
+        
+        result = {}
+        result['type'] = 'ADV_HISTORY'
+        
+        # Fecha y hora (bytes 1-7)
+        result['day'] = data[1]
+        result['month'] = data[2]
+        result['year'] = (data[3] << 8) | data[4]
+        result['hour'] = data[5]
+        result['minute'] = data[6]
+        result['second'] = data[7]
+        
+        # Contador (bytes 8-11, big-endian)
+        result['contador'] = (data[8] << 24) | (data[9] << 16) | (data[10] << 8) | data[11]
+        
+        # V1, V2 (bytes 12-15, big-endian)
+        result['V1'] = (data[12] << 8) | data[13]
+        result['V2'] = (data[14] << 8) | data[15]
+        
+        # Verificar marcador de fin
+        if data[16] == 0xFF:
+            result['end_marker'] = 'OK'
+        else:
+            result['end_marker'] = 'INVALID'
+        
+        return result
+        
+    except Exception:
+        return None
+
+
 def interpret_binary_data(hex_string):
     """
     Interpreta los datos binarios según el formato especificado
@@ -32,6 +81,7 @@ def interpret_binary_data(hex_string):
             return None
 
         result = {}
+        result['type'] = 'STANDARD'
         result['day'] = data[1]
         result['month'] = data[2]
         result['year'] = (data[3] << 8) | data[4]
@@ -57,8 +107,18 @@ def interpret_binary_data(hex_string):
 def format_interpreted_data(data):
     if not data:
         return "❌ Datos no válidos"
+    
     fecha = f"{data['day']:02d}/{data['month']:02d}/{data['year']}"
     hora = f"{data['hour']:02d}:{data['minute']:02d}:{data['second']:02d}"
+    
+    # Verificar si es historial ADV
+    if data.get('type') == 'ADV_HISTORY':
+        end_status = "✅" if data.get('end_marker') == 'OK' else "❌"
+        return (f"📜 [HISTORIAL ADV] {fecha} {hora} | "
+                f"Cnt:{data['contador']} | V1:{data['V1']} V2:{data['V2']} | "
+                f"End:{end_status}")
+    
+    # Formato estándar
     return (f"📊 {fecha} {hora} | Cnt:{data['contador']} | "
             f"V1:{data['V1']} V2:{data['V2']} V3:{data['V3']} V4:{data['V4']} "
             f"V5:{data['V5']} V6:{data['V6']} V7:{data['V7']} V8:{data['V8']} | "
@@ -78,19 +138,30 @@ def generate_csv_from_log(log_file, csv_file):
                 if len(parts) == 2:
                     timestamp = parts[0]
                     hex_data = parts[1]
-                    interpreted = interpret_binary_data(hex_data)
+                    
+                    # Intentar interpretar como historial ADV primero
+                    interpreted = interpret_adv_history(hex_data)
+                    
+                    # Si no es ADV, intentar formato estándar
+                    if not interpreted:
+                        interpreted = interpret_binary_data(hex_data)
+                    
                     if interpreted:
                         fecha = f"{interpreted['day']:02d}/{interpreted['month']:02d}/{interpreted['year']}"
                         hora = f"{interpreted['hour']:02d}:{interpreted['minute']:02d}:{interpreted['second']:02d}"
                         fecha_hora = f"{fecha} {hora}"
                         mac = "N/A"
+                        
+                        # Para historial ADV, batería es N/A
+                        bateria = interpreted.get('battery', 'N/A')
+                        
                         interpreted_data.append({
                             'Fecha': fecha_hora,
                             'Equipo(MAC)': mac,
                             'Counter': interpreted['contador'],
                             'V1': interpreted['V1'],
                             'V2': interpreted['V2'],
-                            'Bateria': interpreted['battery']
+                            'Bateria': bateria
                         })
         if interpreted_data:
             with open(csv_file, 'w', newline='', encoding='utf-8') as csvfile:
@@ -109,28 +180,40 @@ def handle_rx(_, data: bytearray):
     global seen_hex
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     to_write = True
+    
+    # Siempre mostrar el raw hex primero
+    hex_data = data.hex()
+    print(f"📥 Raw hex: {hex_data}")
 
     if len(data) == 3:
         cmd, a, b = data[0], data[1], data[2]
         message = f"Evt={cmd}, A={a}, B={b}"
-        print(f"📥 {message}")
+        print(f"   └─ {message}")
         log_entry = f"{timestamp} - {message}\n"
     else:
         try:
             decoded_text = data.decode('utf-8').strip()
-            print(f"📥 Texto: {decoded_text}")
+            print(f"   └─ Texto: {decoded_text}")
             log_entry = f"{timestamp} - Texto: {decoded_text}\n"
         except UnicodeDecodeError:
-            hex_data = data.hex()
             if hex_data in seen_hex:
                 to_write = False
             else:
                 seen_hex.add(hex_data)
-            print(f"📥 Binario (hex): {hex_data}")
-            interpreted = interpret_binary_data(hex_data)
+            
+            # Intentar interpretar como historial ADV primero
+            interpreted = interpret_adv_history(hex_data)
+            
+            # Si no es ADV, intentar formato estándar
+            if not interpreted:
+                interpreted = interpret_binary_data(hex_data)
+            
             if interpreted:
                 formatted = format_interpreted_data(interpreted)
-                print(f"🔍 Interpretado: {formatted}")
+                print(f"   └─ {formatted}")
+            else:
+                print(f"   └─ Binario sin interpretar")
+            
             log_entry = f"{timestamp} - Binario (hex): {hex_data}\n"
 
     if to_write:
@@ -268,7 +351,14 @@ async def command_loop():
                             if len(parts) == 2:
                                 timestamp = parts[0]
                                 hex_data = parts[1]
-                                interpreted = interpret_binary_data(hex_data)
+                                
+                                # Intentar interpretar como historial ADV primero
+                                interpreted = interpret_adv_history(hex_data)
+                                
+                                # Si no es ADV, intentar formato estándar
+                                if not interpreted:
+                                    interpreted = interpret_binary_data(hex_data)
+                                
                                 if interpreted:
                                     formatted = format_interpreted_data(interpreted)
                                     print(f"{timestamp} | {formatted}")
